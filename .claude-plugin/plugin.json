@@ -1,0 +1,11 @@
+{
+  "name": "line",
+  "description": "LINE channel for Claude Code — push LINE Messaging API events into a running session and reply via the LINE Reply / Push API.",
+  "version": "0.0.2",
+  "keywords": [
+    "line",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}

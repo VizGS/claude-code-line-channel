@@ -1,0 +1,13 @@
+{
+  "name": "vizgs-tools",
+  "owner": {
+    "name": "VizGS"
+  },
+  "plugins": [
+    {
+      "name": "line",
+      "source": "./",
+      "description": "讓你從 LINE 指揮本機 Claude Code、結果回到 LINE 的自建 channel(Bun + TypeScript)"
+    }
+  ]
+}

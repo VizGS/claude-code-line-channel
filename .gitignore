@@ -1,0 +1,4 @@
+node_modules/
+*.log
+# 防呆:本機若在 repo 內放憑證 / 機密(真正的 .env 在 ~/.claude/channels/line/),不可進版控
+.env
