@@ -11,6 +11,7 @@
 - **存取控制**:pairing / allowlist / disabled,只有你授權的來源能注入 session
 - **群組自助授權**:在未授權群組 @ bot,會自動回該群 groupId + 授權指示(類比 1:1 配對)
 - **群組歷史摘要**:已授權群組的訊息記進本機 SQLite,`get_history` 工具讓 Claude 撈指定時間段做摘要
+- **群組名稱解析**:用 LINE getGroupSummary 取群組顯示名;群組訊息進 session 時帶 `group_name` 標籤屬性(消毒後),`get_history` 摘要冠群名表頭,並提供 `get_group_summary` 工具讓 Claude 只憑群組 ID 主動查群名
 - **引用回覆解析**:使用者引用某則訊息時,自動帶出被引用訊息的發話者 + 內容給 Claude
 - **群組媒體硬控制 + 引用取用**:群組媒體 / 檔案**不主動進 session**(背景記錄+即時存檔,不洗版);要針對某張圖 / 檔提問時,**引用**它 + @ bot,channel 帶 `quoted_file_path` 給 Claude Read。1:1 媒體照常 Read + 回
 - **安全**:`x-line-signature` HMAC 驗章、媒體存檔路徑收斂(防 path traversal)、機密只存本機 `.env`
@@ -132,6 +133,16 @@ Claude 遇到工具(Bash / Write / Edit 等)授權提示時,會把提示 **Push 
 
 - 群組發話者名字以 `getGroupMemberProfile`(讀取類 API,**不計訊息額度**)取得並快取;拿不到則退回只記 userId。**1:1 不解析名字**(只記 userId)。
 - **只涵蓋 bot 在場 + 開始記錄之後**的訊息;更早的 LINE 無法補。歷史庫 / inbox 可設 `LINE_RETENTION_DAYS` 自動清理(預設 0 = 永久保留)。
+
+### 群組名稱
+
+群組(`chat_id` 以 `C` 開頭)的顯示名以 `getGroupSummary`(讀取類 API,**不計訊息額度**)取得並快取,出現在三處:
+
+1. **inbound 標籤**:群組訊息進 session 時,`<channel>` 標籤帶 `group_name` 屬性,讓 Claude 以人類可讀名辨識是哪個群。群名是使用者可控字串,**經消毒(白名單字元 + 截 40 字)後才放進屬性**,維持「meta 不被標籤屬性注入」的不變式;送回 LINE 的純文字(授權提示等)則用原始群名。
+2. **`get_group_summary` 工具**:Claude 只憑群組 ID(`C` 開頭)想知道群名時呼叫,回群名 + 頭像 URL。以「本 session 已互動來源」把關,與 `get_history` 同。
+3. **自助授權提示 + `get_history` 表頭**:未授權群組 @ bot 的授權提示會夾入群名;`get_history` 摘要在最前面冠 `群組:<群名> (<群組 ID>)` 表頭。
+
+> **多人聊天室(`R` 開頭)無此 API** —— LINE 不提供 room 名稱,上述各處對 room 一律退回只顯示 ID;1:1(`U` 開頭)亦無群名。
 
 ### 媒體處理(群組硬控制)
 
