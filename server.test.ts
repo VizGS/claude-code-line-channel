@@ -2,7 +2,7 @@
  * Phase 1 測試:簽章驗證、事件去重、webhook 處理(驗章 / 解析 / 去重)。
  */
 
-import { test, expect, beforeAll } from 'bun:test';
+import { test, expect, beforeAll, describe } from 'bun:test';
 import { createHmac } from 'crypto';
 import { Database } from 'bun:sqlite';
 import {
@@ -30,6 +30,9 @@ import {
   createHistoryStore,
   groupMessageRow,
   runGetHistory,
+  runGetGroupSummary,
+  resolveGroupSummary,
+  sanitizeGroupName,
   resolveMemberName,
   fetchAndSaveMedia,
   createInterimTimers,
@@ -3292,4 +3295,485 @@ test('handleCallback: 群組 requireMention:false + 有 @ 文字 → 仍投遞',
 
   // Assert
   expect(delivered).toBe(1);
+});
+
+// ===== 獲取群組名稱:resolveGroupSummary / sanitizeGroupName / runGetGroupSummary / 表頭 / 整合 =====
+// 注意:resolveGroupSummary 內含模組層級 FIFO 快取(無對外重置),故每個會實際 fetch 的測試
+// 都用「獨一無二的 C 開頭 groupId」避免跨測試快取污染(test smell:互相依賴 / 未清理狀態)。
+
+describe('resolveGroupSummary', () => {
+  /**
+   * 情境:happy —— 非 C 開頭(room R / 1:1 U)直接回 undefined,連 fetch 都不打
+   * Mock:globalThis.fetch(計數器,驗證完全沒被呼叫)
+   * 預期:回 undefined 且 calls 為 0(不浪費 API 額度)
+   */
+  test('非 C 開頭直接回 undefined 且不打 API', async () => {
+    // Arrange
+    const orig = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (() => {
+      calls += 1;
+
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as typeof fetch;
+
+    try {
+      // Act + Assert:R / U 前綴都不該觸發 summary API
+      expect(await resolveGroupSummary('R999notC')).toBeUndefined();
+      expect(await resolveGroupSummary('U999notC')).toBeUndefined();
+      expect(calls).toBe(0);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 情境:happy —— C 開頭且 res.ok,回 {groupName, pictureUrl} 並快取
+   * Mock:globalThis.fetch(計數器 + 記錄 URL)
+   * 預期:回正確摘要、打到 /summary endpoint、同 groupId 第二次走快取(calls 仍為 1)
+   */
+  test('C 開頭 ok 回 {groupName,pictureUrl} 並快取(第二次不重打)', async () => {
+    // Arrange
+    const orig = globalThis.fetch;
+    let calls = 0;
+    let calledUrl = '';
+    globalThis.fetch = ((url: string | URL | Request) => {
+      calls += 1;
+      calledUrl = String(url);
+
+      return Promise.resolve(new Response(JSON.stringify({ groupName: '行銷部', pictureUrl: 'https://p/x.jpg' }), { status: 200 }));
+    }) as typeof fetch;
+
+    try {
+      // Act:同一 groupId 連續解析兩次
+      const first = await resolveGroupSummary('Ccache001');
+      const second = await resolveGroupSummary('Ccache001');
+
+      // Assert
+      expect(first).toEqual({ groupName: '行銷部', pictureUrl: 'https://p/x.jpg' });
+      expect(second).toEqual({ groupName: '行銷部', pictureUrl: 'https://p/x.jpg' });
+      expect(calledUrl).toContain('/group/Ccache001/summary');
+      expect(calls).toBe(1); // 第二次走快取
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 測試目標:resolveGroupSummary()
+   * 情境:regression —— C 開頭 200 但 body 缺 groupName(如 {pictureUrl} 無群名)時不快取,保留下次重試
+   * Mock:globalThis.fetch(計數器;每次回 200 但僅含 pictureUrl、無 groupName)
+   * 預期:回物件但 groupName 為 undefined;同 groupId 第二次仍重打(calls 為 2,證明沒被快取)
+   * 對應修正:REV-001(比照 resolveMemberName,200 缺群名不快取)
+   */
+  test('200 但缺 groupName 不快取(第二次仍重打)', async () => {
+    // Arrange
+    const orig = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (() => {
+      calls += 1;
+
+      return Promise.resolve(new Response(JSON.stringify({ pictureUrl: 'https://p/noname.jpg' }), { status: 200 }));
+    }) as typeof fetch;
+
+    try {
+      // Act:同一 groupId 連續解析兩次
+      const first = await resolveGroupSummary('Cnoname1');
+      const second = await resolveGroupSummary('Cnoname1');
+
+      // Assert:沒拿到群名 → 不快取 → 第二次仍打 API(對比上方「有 groupName → 第二次走快取」)
+      expect(first?.groupName).toBeUndefined();
+      expect(second?.groupName).toBeUndefined();
+      expect(calls).toBe(2);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 情境:exception —— C 開頭但 res 非 2xx(bot 不在該群 / LINE 暫時無法提供)
+   * Mock:globalThis.fetch 回 404
+   * 預期:回 undefined(不快取、不丟例外)
+   */
+  test('C 開頭但非 2xx 回 undefined', async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response('{}', { status: 404 }))) as typeof fetch;
+
+    try {
+      expect(await resolveGroupSummary('C404bad')).toBeUndefined();
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 情境:exception —— fetch 直接 reject(網路錯誤)
+   * Mock:globalThis.fetch reject
+   * 預期:被 try/catch 收斂回 undefined,不向外丟例外
+   */
+  test('fetch reject 回 undefined 不丟例外', async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = (() => Promise.reject(new Error('ECONNRESET'))) as typeof fetch;
+
+    try {
+      expect(await resolveGroupSummary('Cthrow01')).toBeUndefined();
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});
+
+describe('sanitizeGroupName', () => {
+  /**
+   * 情境:exception —— 含引號 / 角括號的注入字串(模擬可破壞標籤屬性的群名)
+   * Mock:無需 mock(純函式)
+   * 預期:" < > 等危險字元全數移除,無法破壞屬性
+   */
+  test('含引號/角括號的注入字串被清乾淨', () => {
+    // Arrange
+    const malicious = 'a"><script>x</script>';
+
+    // Act
+    const result = sanitizeGroupName(malicious);
+
+    // Assert
+    expect(result).not.toContain('"');
+    expect(result).not.toContain('<');
+    expect(result).not.toContain('>');
+    expect(result).toBe('ascriptxscript');
+  });
+
+  /**
+   * 情境:happy —— 全為白名單字元(中文 / 英數 / 空白 / 底線 / 連字號)
+   * Mock:無需 mock(純函式)
+   * 預期:原樣保留
+   */
+  test('中文/英數/空白/底線/連字號保留', () => {
+    expect(sanitizeGroupName('行銷部 group_1-A')).toBe('行銷部 group_1-A');
+  });
+
+  /**
+   * 情境:boundary —— 超過 40 字
+   * Mock:無需 mock(純函式)
+   * 預期:截斷到 40 字
+   */
+  test('超過 40 字被截斷到 40 字', () => {
+    // Arrange + Act
+    const result = sanitizeGroupName('a'.repeat(50));
+
+    // Assert
+    expect(result.length).toBe(40);
+    expect(result).toBe('a'.repeat(40));
+  });
+
+  /**
+   * 情境:boundary —— 全為非白名單符號
+   * Mock:無需 mock(純函式)
+   * 預期:回空字串
+   */
+  test('全符號 → 回空字串', () => {
+    expect(sanitizeGroupName('!@#$%^&*()<>"\'')).toBe('');
+  });
+
+  /**
+   * 測試目標:sanitizeGroupName()
+   * 情境:regression —— 含 astral 平面字(CJK 擴充 B,屬 \p{L} 會通過白名單)的群名截斷
+   * Mock:無需 mock(純函式)
+   * 預期:(a) 41 個 astral 字 → 恰 40 個完整 code point、無落單 surrogate;(b) 41 個 BMP 中文字 → 40 字行為不變
+   * 對應修正:REV-002(截斷改以 code point 計,避免切斷 astral 字代理對)
+   */
+  test('astral 字以 code point 截斷(不切斷代理對)', () => {
+    // Arrange:astral = CJK 擴充 B 𠀀(U+20000),1 個 code point = 2 個 UTF-16 code unit
+    const astral = '\u{20000}';
+    // 落單 surrogate:高位後無低位,或低位前無高位(舊 code unit 截法在奇數邊界會切出落單位)
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+    // Act (a):41 個 astral 字
+    const astralResult = sanitizeGroupName(astral.repeat(41));
+
+    // Assert (a):恰 40 個完整 code point(舊 code unit 截法只會剩 20 個)、結果完整且無落單 surrogate
+    expect([...astralResult].length).toBe(40);
+    expect(astralResult).toBe(astral.repeat(40));
+    expect(loneSurrogate.test(astralResult)).toBe(false);
+
+    // Act + Assert (b):純 BMP 對照組 —— 41 個中文字截到 40,行為不變
+    const bmpResult = sanitizeGroupName('中'.repeat(41));
+    expect([...bmpResult].length).toBe(40);
+    expect(bmpResult).toBe('中'.repeat(40));
+  });
+});
+
+describe('runGetGroupSummary', () => {
+  /**
+   * 情境:exception —— 缺 chat_id
+   * Mock:注入永遠回有名的 resolve stub(驗證 stub 不應被呼叫到)
+   * 預期:isError,訊息提示需要 chat_id
+   */
+  test('缺 chat_id → isError', async () => {
+    const resolve = async () => ({ groupName: 'X' });
+    const res = await runGetGroupSummary({}, resolve);
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('需要 chat_id');
+  });
+
+  /**
+   * 情境:exception —— isKnownChat 回 false(非本 session 已互動來源)
+   * Mock:注入 resolve stub(計數器,驗證被 gate 擋下、不解析)
+   * 預期:isError 拒絕,且 resolve 未被呼叫
+   */
+  test('isKnownChat 回 false → 拒絕(isError),不解析', async () => {
+    // Arrange
+    let resolveCalled = 0;
+    const resolve = async () => {
+      resolveCalled += 1;
+
+      return { groupName: 'X' };
+    };
+
+    // Act
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve, () => false);
+
+    // Assert
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('不在本 session 已互動來源');
+    expect(resolveCalled).toBe(0);
+  });
+
+  /**
+   * 情境:happy —— resolve 回有 groupName 但無頭像
+   * Mock:注入 resolve stub
+   * 預期:單行「群組名稱:X」,不含頭像行
+   */
+  test('resolve 回有 groupName(無頭像)→ 回「群組名稱:X」', async () => {
+    const resolve = async () => ({ groupName: '行銷部' });
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve);
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toBe('群組名稱:行銷部');
+  });
+
+  /**
+   * 情境:happy —— resolve 回 groupName + pictureUrl
+   * Mock:注入 resolve stub
+   * 預期:「群組名稱:X」後接「頭像:URL」
+   */
+  test('resolve 回 groupName + pictureUrl → 加「頭像:URL」', async () => {
+    const resolve = async () => ({ groupName: '行銷部', pictureUrl: 'https://p/x.jpg' });
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve);
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toBe('群組名稱:行銷部\n頭像:https://p/x.jpg');
+  });
+
+  /**
+   * 情境:exception —— resolve 回 undefined(取不到摘要)
+   * Mock:注入回 undefined 的 resolve stub
+   * 預期:isError「取不到群組名稱」
+   */
+  test('resolve 回 undefined → isError 取不到群組名稱', async () => {
+    const resolve = async () => undefined;
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve);
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('取不到群組名稱');
+  });
+
+  /**
+   * 情境:exception —— resolve 回物件但缺 groupName(只有頭像)
+   * Mock:注入回 {pictureUrl} 的 resolve stub
+   * 預期:isError「取不到群組名稱」(無名一律視為取不到)
+   */
+  test('resolve 回物件但無 groupName → isError', async () => {
+    const resolve = async () => ({ pictureUrl: 'https://p/x.jpg' });
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve);
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('取不到群組名稱');
+  });
+
+  /**
+   * 情境:happy —— isKnownChat 回 true(已互動來源)應放行
+   * Mock:注入 resolve stub
+   * 預期:正常解析,回「群組名稱:X」(驗證 isKnownChat 不誤擋)
+   */
+  test('isKnownChat 回 true → 放行並正常解析', async () => {
+    const resolve = async () => ({ groupName: '客服群' });
+    const res = await runGetGroupSummary({ chat_id: 'C1' }, resolve, () => true);
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toBe('群組名稱:客服群');
+  });
+});
+
+describe('runGetHistory: groupName 表頭(第 5 參數)', () => {
+  /**
+   * 情境:happy —— 傳 groupName 時輸出最前面多一行「群組:X (chat_id)」
+   * Mock:無需 mock(注入 in-memory store)
+   * 預期:首行為群組表頭,後接紀錄
+   */
+  test('傳 groupName → 最前面多一行「群組:X (chat_id)」', () => {
+    // Arrange
+    const store = memStore();
+    store.record('G1', 5000, 'U1', 'Alice', 'text', 'hello');
+
+    // Act
+    const res = runGetHistory({ chat_id: 'G1', since: '1000', until: '9000' }, store, 99999, undefined, '行銷部');
+
+    // Assert
+    expect(res.content[0].text.startsWith('群組:行銷部 (G1)\n')).toBe(true);
+    expect(res.content[0].text).toContain('hello');
+  });
+
+  /**
+   * 情境:happy —— 不傳 groupName 維持原樣(回歸既有行為,不破壞既有測試)
+   * Mock:無需 mock(注入 in-memory store)
+   * 預期:無群組表頭,直接從第一筆紀錄起
+   */
+  test('不傳 groupName → 無群組表頭(維持原樣)', () => {
+    // Arrange
+    const store = memStore();
+    store.record('G1', 5000, 'U1', 'Alice', 'text', 'hello');
+
+    // Act
+    const res = runGetHistory({ chat_id: 'G1', since: '1000', until: '9000' }, store, 99999);
+
+    // Assert
+    expect(res.content[0].text).not.toContain('群組:');
+    expect(res.content[0].text.startsWith('[')).toBe(true);
+  });
+
+  /**
+   * 情境:boundary —— 空紀錄 + 傳 groupName(表頭應與無紀錄提示並存)
+   * Mock:無需 mock(空 in-memory store)
+   * 預期:「群組:X (chat_id)」換行接「(此時間段無紀錄)」
+   */
+  test('空紀錄 + groupName → 表頭仍帶,接無紀錄提示', () => {
+    const res = runGetHistory({ chat_id: 'Cempty1', minutes: 60 }, memStore(), 10000, undefined, '客服群');
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toBe('群組:客服群 (Cempty1)\n(此時間段無紀錄)');
+  });
+});
+
+describe('handleCallback: 群組名稱整合(Surface B / C)', () => {
+  /**
+   * 測試目標:handleCallback 群組投遞 meta.group_name(Surface B)
+   * 情境:happy —— 授權 C 群組 + @ → 投遞訊息的 meta 帶消毒後群名
+   * Mock:globalThis.fetch 回含危險字元的群名(驗證投遞前經 sanitizeGroupName)
+   * 預期:onMessage 收到 1 則,meta.group_name 為消毒後字串
+   */
+  test('群組訊息投遞時 meta.group_name 帶入(經消毒)', async () => {
+    // Arrange:summary 回一個含 < > " 的群名,驗證消毒
+    const orig = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({ groupName: '行銷<部>"x"' }), { status: 200 }))) as typeof fetch;
+    const metas: Record<string, string>[] = [];
+    const access = { ...pairingAccess, allowGroups: { Cdeliver1: ['U1'] } };
+    const event = { type: 'message', webhookEventId: 'sb-deliver', source: { type: 'group', groupId: 'Cdeliver1', userId: 'U1' }, message: { id: 'm-sb', type: 'text', text: 'hi bot', mention: { mentionees: [{ isSelf: true }] } } };
+    const body = JSON.stringify({ events: [event] });
+
+    try {
+      // Act
+      await handleCallback(webhookRequest(body, sign(body)), msg => {
+        metas.push(msg.meta);
+      }, { access, requireMention: true, logGroup: () => {} });
+
+      // Assert
+      expect(metas.length).toBe(1);
+      expect(metas[0].group_name).toBe('行銷部x'); // < > " 全被消毒
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 測試目標:handleCallback 1:1 投遞 meta(Surface B 對照)
+   * 情境:boundary —— 1:1 訊息不走群組路徑,meta 不應帶 group_name
+   * Mock:logDirect 空殼(避免寫真實歷史庫);1:1 路徑不會打 summary,故無需 mock fetch
+   * 預期:onMessage 收到 1 則,meta.group_name 為 undefined
+   */
+  test('1:1 訊息不帶 group_name', async () => {
+    // Arrange
+    const metas: Record<string, string>[] = [];
+    const access = { ...pairingAccess, dmPolicy: 'allowlist' as const, allowFrom: ['U1'] };
+    const body = JSON.stringify({ events: [dmEvent('sb-dm', 'U1')] });
+
+    // Act
+    await handleCallback(webhookRequest(body, sign(body)), msg => {
+      metas.push(msg.meta);
+    }, { access, logDirect: () => {} });
+
+    // Assert
+    expect(metas.length).toBe(1);
+    expect(metas[0].group_name).toBeUndefined();
+  });
+
+  /**
+   * 測試目標:handleCallback group_pair reply 文字(Surface C)
+   * 情境:happy —— 未授權 C 群組被 @ → group_pair,reply 夾入(群組名:X)
+   * Mock:globalThis.fetch 回 summary;sendDeps 記錄 reply 文字
+   * 預期:reply 同時含群組 ID 與(群組名:X)
+   */
+  test('未授權 C 群組被 @ → group_pair reply 夾入(群組名:X)', async () => {
+    // Arrange
+    const orig = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({ groupName: '行銷部' }), { status: 200 }))) as typeof fetch;
+    const replies: string[] = [];
+    const event = { type: 'message', webhookEventId: 'sc-grouppair', replyToken: 'rt', source: { type: 'group', groupId: 'Cgrouppair1', userId: 'U1' }, message: { id: 'm-gp', type: 'text', text: 'hi bot', mention: { mentionees: [{ isSelf: true }] } } };
+    const body = JSON.stringify({ events: [event] });
+    const sendDeps = {
+      reply: async (_t: string, m: { type: 'text'; text: string }[]) => {
+        replies.push(m[0].text);
+
+        return { ok: true, status: 200 };
+      },
+      push: async () => ({ ok: true, status: 200 }),
+    };
+
+    try {
+      // Act:pairingAccess 的 allowGroups 為空 → Cgrouppair1 未授權
+      await handleCallback(webhookRequest(body, sign(body)), () => {}, { access: pairingAccess, sendDeps });
+
+      // Assert
+      expect(replies[0]).toContain('群組 ID:Cgrouppair1');
+      expect(replies[0]).toContain('(群組名:行銷部)');
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  /**
+   * 測試目標:handleCallback member_pair reply 文字(Surface C)
+   * 情境:happy —— 已授權 C 群組、非成員被 @ → member_pair,reply 夾入(群組名:X)
+   * Mock:globalThis.fetch 回 summary;sendDeps 記錄 reply;logGroup 空殼(群組已授權會記錄)
+   * 預期:reply 同時含「你的 userId」與「此群(群組名:X)」
+   */
+  test('已授權 C 群組非成員被 @ → member_pair reply 夾入(群組名:X)', async () => {
+    // Arrange:Cmemberpair1 授權但只 U1 是成員,發話者 U9 非成員
+    const orig = globalThis.fetch;
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({ groupName: '客服群' }), { status: 200 }))) as typeof fetch;
+    const replies: string[] = [];
+    const access = { ...pairingAccess, allowGroups: { Cmemberpair1: ['U1'] } };
+    const event = { type: 'message', webhookEventId: 'sc-memberpair', replyToken: 'rt', source: { type: 'group', groupId: 'Cmemberpair1', userId: 'U9' }, message: { id: 'm-mp', type: 'text', text: 'hi bot', mention: { mentionees: [{ isSelf: true }] } } };
+    const body = JSON.stringify({ events: [event] });
+    const sendDeps = {
+      reply: async (_t: string, m: { type: 'text'; text: string }[]) => {
+        replies.push(m[0].text);
+
+        return { ok: true, status: 200 };
+      },
+      push: async () => ({ ok: true, status: 200 }),
+    };
+
+    try {
+      // Act
+      await handleCallback(webhookRequest(body, sign(body)), () => {}, { access, sendDeps, logGroup: () => {} });
+
+      // Assert
+      expect(replies[0]).toContain('你的 userId:U9');
+      expect(replies[0]).toContain('此群(群組名:客服群)');
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
 });
